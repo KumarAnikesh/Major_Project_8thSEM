@@ -5,6 +5,10 @@
 # CROSS-PLATFORM COMPATIBLE
 # UPDATED: NDSI threshold = 0.4 (positive values = snow)
 # ADDED: Load Model Tab
+# ✅ NEW: DYNAMIC PATCH SIZE DETECTION
+#    - Automatically detects model input size (128x128 or 256x256)
+#    - Works with models trained on different patch sizes
+#    - Auto-updates window_size and stride based on loaded model
 # ==========================================
 
 import tkinter as tk
@@ -154,16 +158,18 @@ def validate_model_with_composite(model, composite_path, log_callback=None):
         if expected_channels != 8:
             log(f"\n[WARNING] Model expects {expected_channels} channels, but composite has 8!")
         
-        # Test prediction on small patch
+        # ✅ DYNAMIC PATCH SIZE - Auto-detect from model input shape
+        patch_size = model.input_shape[1]  # Extract patch size from model (128 or 256)
+        log(f"   Detected patch size: {patch_size}x{patch_size}")
+        
+        # Test prediction on patch
         log("\n" + "="*80)
-        log("TESTING PREDICTION ON 256x256 PATCH")
+        log(f"TESTING PREDICTION ON {patch_size}x{patch_size} PATCH")
         log("="*80)
         
         # Extract center patch
         h, w = preprocessed.shape[0], preprocessed.shape[1]
         center_h, center_w = h // 2, w // 2
-        
-        patch_size = 256
         h_start = max(0, center_h - patch_size // 2)
         w_start = max(0, center_w - patch_size // 2)
         h_end = min(h, h_start + patch_size)
@@ -483,8 +489,13 @@ model_preview_canvas = None
 model_result_label = None
 model_batch_folder = None
 model_output_folder = None
-window_size = 128  # Default window size for sliding window
+# ✅ DYNAMIC: Will be set based on loaded model's input shape
+window_size = 128  # Default window size (updated when model is loaded)
 stride = 64  # Default stride (overlap = window_size - stride)
+
+# GUI widget variables (will be set when GUI is created)
+window_size_var = None
+stride_var = None
 
 # NEW: Validation window globals
 validation_window = None
@@ -976,7 +987,7 @@ def predict_with_sliding_window(model, img_data, window_size, stride, target_cha
     
     Args:
         model: Loaded Keras model
-        img_data: Original image data (H, W, C)
+        img_data: Original image data (H, W, C) - MUST be preprocessed composite
         window_size: Size of sliding window (assumes square window)
         stride: Step size for sliding window
         target_channels: Number of channels model expects
@@ -996,13 +1007,9 @@ def predict_with_sliding_window(model, img_data, window_size, stride, target_cha
             padding = np.repeat(img_data[:, :, -1:], padding_needed, axis=2)
             img_data = np.concatenate([img_data, padding], axis=2)
     
-    # Normalize image to 0-1 if needed
-    if img_data.dtype == np.uint8:
-        img_data = img_data.astype(np.float32) / 255.0
-    elif img_data.max() > 1.0:
-        img_min, img_max = img_data.min(), img_data.max()
-        if img_max > img_min:
-            img_data = (img_data - img_min) / (img_max - img_min)
+    # ✅ FIX: Input should already be preprocessed using preprocess_for_model()
+    # Do NOT apply additional normalization here!
+    # The img_data passed in should be the output of preprocess_for_model()
     
     # Initialize prediction and count maps
     # Check model output shape to determine prediction map size
@@ -1180,64 +1187,58 @@ def run_model_prediction_CORRECTED():
             )
             return
         
-        # 🔧 CRITICAL FIX: PROPER NORMALIZATION FOR ALL 8 BANDS
-        # The composite bands are already preprocessed:
-        # - Bands 1-5: Reflectance (already in [0, 1] range from composite creation)
-        # - Bands 6-8: Indices (NDSI, NDWI, NDVI in [-1, 1] range)
-        print(f"\n🔄 NORMALIZING BANDS TO [0, 1] RANGE:")
-        normalized_composite = np.zeros_like(composite, dtype=np.float32)
+        # 🔧 CRITICAL FIX: USE SAME PREPROCESSING AS VALIDATION
+        # The validation function uses per-band STANDARDIZATION (z-score normalization)
+        # Not min-max [0,1] normalization!
+        print(f"\n🔄 APPLYING PER-BAND STANDARDIZATION (same as validation):")
         
-        for i in range(8):
-            band = composite[:, :, i].astype(np.float32)
-            
-            # Handle NaN and Inf BEFORE statistics
-            valid_mask = np.isfinite(band)
-            if not np.any(valid_mask):
-                print(f"   Band {i+1}: ALL NaN/Inf - filling with zeros")
-                normalized_composite[:, :, i] = 0.0
-                continue
-            
-            band_min = np.nanmin(band[valid_mask])
-            band_max = np.nanmax(band[valid_mask])
-            band_mean = np.nanmean(band[valid_mask])
-            
-            print(f"   Band {i+1}: range=[{band_min:.6f}, {band_max:.6f}], mean={band_mean:.6f}", end="")
-            
-            # Replace NaN/Inf with mean (better than 0)
-            band = np.where(valid_mask, band, band_mean)
-            
-            # CRITICAL: Different normalization based on band type
-            if i < 5:
-                # Bands 1-5: Reflectance bands (ALREADY in ~[0, 1] from composite creation)
-                # The composite code divides by SCALING_FACTOR (10000), so values are already [0, 1]
-                # DO NOT re-normalize - just clip to ensure [0, 1]
-                normalized_band = np.clip(band, 0.0, 1.0)
-                print(f" → reflectance (clipped to [0,1])", end="")
-            else:
-                # Bands 6-8: Spectral indices (NDSI, NDWI, NDVI) in [-1, 1]
-                # Map [-1, 1] → [0, 1] for neural network input
-                normalized_band = (band + 1.0) / 2.0
-                normalized_band = np.clip(normalized_band, 0.0, 1.0)
-                print(f" → index (mapped [-1,1] to [0,1])", end="")
-            
-            normalized_composite[:, :, i] = normalized_band
-            
-            # Verify normalization worked
-            norm_min = np.min(normalized_composite[:, :, i])
-            norm_max = np.max(normalized_composite[:, :, i])
-            norm_mean = np.mean(normalized_composite[:, :, i])
-            norm_std = np.std(normalized_composite[:, :, i])
-            print(f" → result=[{norm_min:.6f}, {norm_max:.6f}], mean={norm_mean:.6f}, std={norm_std:.6f}")
+        # Use the exact same preprocessing function as validation
+        input_data, preprocess_log = preprocess_for_model(composite)
         
-        # Use normalized composite
-        input_data = normalized_composite
+        # Print the preprocessing log for debugging
+        for log_line in preprocess_log.split('\n'):
+            if log_line.strip():
+                print(f"   {log_line}")
         
-        print(f"\\n📥 Normalized Input Data:")
+        print(f"\\n📥 Preprocessed Input Data:")
         print(f"   Shape: {input_data.shape}")
         print(f"   Dtype: {input_data.dtype}")
         
         set_status(f"✓ Normalized {height}x{width} image", "success")
         root.update()
+        
+        # ✅ CRITICAL VALIDATION: Ensure window_size matches model's expected input size
+        model_expected_size = loaded_model.input_shape[1]
+        
+        if window_size != model_expected_size:
+            error_msg = (
+                f"❌ WINDOW SIZE MISMATCH DETECTED!\n\n"
+                f"🚫 This will cause INCORRECT PREDICTIONS!\n\n"
+                f"Model expects: {model_expected_size}x{model_expected_size}\n"
+                f"Current window_size: {window_size}x{window_size}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"WHY THIS ERROR?\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Your model was trained on {model_expected_size}x{model_expected_size} patches.\n"
+                f"If you use a different window size ({window_size}x{window_size}),\n"
+                f"the predictions will be WRONG!\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"HOW TO FIX?\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"OPTION 1 (Recommended - Automatic):\n"
+                f"  → Reload the model\n"
+                f"  → Window size will auto-update to {model_expected_size}\n\n"
+                f"OPTION 2 (Manual):\n"
+                f"  → Go to 'Prediction Settings' in this tab\n"
+                f"  → Set Window Size = {model_expected_size}\n"
+                f"  → Click 'Apply Settings'\n"
+            )
+            
+            messagebox.showerror("Window Size Mismatch!", error_msg)
+            set_status("❌ Window size doesn't match model input size!", "error")
+            return
+        
+        print(f"✅ Window size validation passed: {window_size} == {model_expected_size}")
         
         set_status(f"⏳ Running prediction (window: {window_size}x{window_size}, stride: {stride})...", "warning")
         root.update()
@@ -1519,6 +1520,24 @@ def run_batch_prediction_CORRECTED():
         
         threshold = 0.5  # Fixed threshold, make adjustable if needed
         
+        # ✅ CRITICAL VALIDATION: Check window_size matches model input
+        global window_size, stride
+        model_expected_size = loaded_model.input_shape[1]
+        
+        if window_size != model_expected_size:
+            messagebox.showerror(
+                "Window Size Mismatch!",
+                f"❌ ERROR: Window size mismatch!\n\n"
+                f"Model expects: {model_expected_size}x{model_expected_size}\n"
+                f"Current window_size: {window_size}x{window_size}\n\n"
+                f"Batch prediction ABORTED to prevent incorrect results!\n\n"
+                f"Fix: Reload the model or manually set window_size = {model_expected_size}"
+            )
+            set_status("❌ Batch prediction aborted - window size mismatch", "error")
+            return
+        
+        print(f"✅ Batch prediction validation passed: window_size={window_size}")
+        
         for i, filename in enumerate(image_files, 1):
             img_path = os.path.join(model_batch_folder, filename)
             
@@ -1552,7 +1571,6 @@ def run_batch_prediction_CORRECTED():
                 # ==========================================
                 # USE SLIDING WINDOW FOR LARGE IMAGES
                 # ==========================================
-                global window_size, stride
                 
                 if orig_height > target_height or orig_width > target_width:
                     # Use sliding window prediction
@@ -1765,6 +1783,28 @@ def upload_model():
                 f"Failed to load model:\n{str(e)}"
             )
             return
+        
+        # ✅ AUTO-UPDATE window_size based on model input shape
+        global window_size, stride, window_size_var, stride_var
+        input_shape = loaded_model.input_shape
+        detected_size = input_shape[1]  # Get patch size from model (128 or 256)
+        
+        window_size = detected_size
+        stride = detected_size // 2  # 50% overlap by default
+        
+        # ✅ Also update the GUI entry fields if they exist
+        try:
+            if window_size_var is not None:
+                window_size_var.set(detected_size)
+            if stride_var is not None:
+                stride_var.set(stride)
+        except Exception as e:
+            print(f"[WARNING] Could not update GUI fields: {e}")
+        
+        print(f"[INFO] Auto-detected model patch size: {detected_size}x{detected_size}")
+        print(f"[INFO] Updated window_size={window_size}, stride={stride}")
+        if window_size_var is not None:
+            print(f"[INFO] GUI fields updated automatically")
 
         # Update UI
         model_filename_display.config(
@@ -1776,7 +1816,9 @@ def upload_model():
         model_info = []
         model_info.append(f"✅ Model loaded successfully!\n")
         model_info.append(f"📁 File: {os.path.basename(model_path)}\n")
-        model_info.append(f"📊 Size: {os.path.getsize(model_path) / (1024*1024):.2f} MB\n\n")
+        model_info.append(f"📊 Size: {os.path.getsize(model_path) / (1024*1024):.2f} MB\n")
+        model_info.append(f"🎯 Detected Patch Size: {window_size}x{window_size}\n")
+        model_info.append(f"🔄 Sliding Window: {window_size}x{window_size} (stride={stride})\n\n")
 
         model_info.append("=" * 50 + "\n")
         model_info.append("MODEL ARCHITECTURE:\n")
@@ -1807,7 +1849,9 @@ def upload_model():
             f"Model loaded successfully!\n\n"
             f"File: {os.path.basename(model_path)}\n"
             f"Parameters: {loaded_model.count_params():,}\n"
-            f"Layers: {len(loaded_model.layers)}"
+            f"Layers: {len(loaded_model.layers)}\n\n"
+            f"🎯 Detected Input Size: {window_size}x{window_size}\n"
+            f"🔄 Sliding Window: {window_size}x{window_size} (stride={stride})"
         )
 
     except Exception as e:
@@ -3478,6 +3522,7 @@ def _build_model_tab():
     """Build model-tab widgets exactly once, on first tab-switch to it."""
     global model_filename_display, model_details_text, _model_tab_built
     global model_preview_canvas, model_result_label
+    global window_size, stride, window_size_var, stride_var
     if _model_tab_built:
         return
     _model_tab_built = True
@@ -3647,7 +3692,8 @@ def _build_model_tab():
         anchor='w'
     ).pack(side='left', padx=(0, 10))
 
-    window_size_var = tk.IntVar(value=128)
+    # Already declared global at function start
+    window_size_var = tk.IntVar(value=window_size)  # Use current window_size
     window_size_entry = tk.Entry(
         window_size_frame,
         textvariable=window_size_var,
@@ -3684,7 +3730,8 @@ def _build_model_tab():
         anchor='w'
     ).pack(side='left', padx=(0, 54))
 
-    stride_var = tk.IntVar(value=64)
+    # Already declared global at function start
+    stride_var = tk.IntVar(value=stride)  # Use current stride
     stride_entry = tk.Entry(
         stride_frame,
         textvariable=stride_var,
@@ -3710,7 +3757,7 @@ def _build_model_tab():
 
     # Apply Button
     def apply_window_settings():
-        global window_size, stride
+        global window_size, stride, loaded_model
         try:
             new_window_size = window_size_var.get()
             new_stride = stride_var.get()
@@ -3727,13 +3774,34 @@ def _build_model_tab():
                 messagebox.showwarning("Invalid Stride", "Stride cannot be larger than window size")
                 return
             
+            # ✅ CRITICAL VALIDATION: Check if window_size matches loaded model's input size
+            if loaded_model is not None:
+                model_input_size = loaded_model.input_shape[1]
+                
+                if new_window_size != model_input_size:
+                    messagebox.showerror(
+                        "❌ Window Size Mismatch!",
+                        f"ERROR: Your model expects {model_input_size}x{model_input_size} patches!\n\n"
+                        f"You tried to set: {new_window_size}x{new_window_size}\n\n"
+                        f"🚫 This will cause INCORRECT PREDICTIONS!\n\n"
+                        f"The model was trained on {model_input_size}x{model_input_size} patches.\n"
+                        f"Window size MUST match the model's input size.\n\n"
+                        f"✅ Correct setting: {model_input_size}x{model_input_size}\n"
+                        f"❌ Your setting: {new_window_size}x{new_window_size}\n\n"
+                        f"Please use window_size = {model_input_size}"
+                    )
+                    return
+            
             window_size = new_window_size
             stride = new_stride
             
             overlap = window_size - stride
             messagebox.showinfo(
-                "Settings Applied",
-                f"Window Size: {window_size}x{window_size}\nStride: {stride}\nOverlap: {overlap} pixels"
+                "✓ Settings Applied",
+                f"Window Size: {window_size}x{window_size}\n"
+                f"Stride: {stride}\n"
+                f"Overlap: {overlap} pixels\n\n"
+                f"{'✅ Matches model input size!' if loaded_model and window_size == loaded_model.input_shape[1] else '⚠️ No model loaded yet'}"
             )
             set_status(f"✓ Window settings updated: {window_size}x{window_size}, stride={stride}", "success")
             
